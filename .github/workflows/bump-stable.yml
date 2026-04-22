@@ -1,4 +1,4 @@
-name: bump nixpkgs
+name: bump stable
 on:
   schedule:
     - cron: '0 6 * * *'
@@ -18,18 +18,41 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Update nixpkgs input
-        run: nix flake update nixpkgs
-
-      - name: Commit if changed
+      - name: Detect latest NixOS/nix release tag
+        id: latest
         run: |
-          if git diff --quiet flake.lock; then
-            echo "nixpkgs already at latest"
+          tag=$(gh api repos/NixOS/nix/releases/latest --jq .tag_name)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect current pinned tag
+        id: current
+        run: |
+          current=$(grep -oE 'github:NixOS/nix/[0-9.]+' flake.nix | head -1 | sed 's|.*/||')
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+
+      - name: Bump flake.nix if tag changed
+        if: steps.latest.outputs.tag != steps.current.outputs.current
+        run: |
+          sed -i "s|github:NixOS/nix/${{ steps.current.outputs.current }}|github:NixOS/nix/${{ steps.latest.outputs.tag }}|" flake.nix
+
+      - name: nix flake update
+        run: nix flake update
+
+      - name: Commit if anything changed
+        run: |
+          if git diff --quiet flake.nix flake.lock; then
+            echo "no changes"
             exit 0
           fi
           git config user.name  'bump-bot'
           git config user.email 'bump-bot@users.noreply.github.com'
-          new_rev=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock | cut -c1-12)
-          git add flake.lock
-          git commit -m "bump: nixpkgs → ${new_rev}"
+          git add flake.nix flake.lock
+          if [[ "${{ steps.latest.outputs.tag }}" != "${{ steps.current.outputs.current }}" ]]; then
+            msg="bump: nix-upstream ${{ steps.current.outputs.current }} → ${{ steps.latest.outputs.tag }}"
+          else
+            msg="bump: flake inputs refreshed"
+          fi
+          git commit -m "$msg"
           git push

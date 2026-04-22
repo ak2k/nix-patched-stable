@@ -54,15 +54,19 @@ Systems published: `aarch64-darwin`, `aarch64-linux`.
 
 ## How it works
 
-- `flake.nix` takes `nixpkgs.legacyPackages.<system>.nixVersions.latest` as
-  the base and applies the two patches in `patches/` via `overrideAttrs`.
-- `bump-stable.yml` runs daily (06:00 UTC) and on manual dispatch; it does
-  `nix flake update nixpkgs` and commits when the pinned nixpkgs advances.
-  Any new `nixVersions.latest` bump lands here.
-- `build-and-cache.yml` runs on every push to `main`, builds the patched
-  nix on `macos-latest` (aarch64-darwin) and `ubuntu-24.04-arm`
-  (aarch64-linux), runs `./result/bin/nix --version` as a smoke test, and
-  pushes the build closure to `ak2k.cachix.org` via `cachix-action`.
+- `flake.nix` pulls `github:NixOS/nix/<latest-tag>` as an input, applies the
+  two patches in `patches/` via `nixpkgs.applyPatches`, then imports the
+  patched source's `default.nix` (which is flake-compat-wrapped) and forwards
+  `packages.<system>.default` from there. This builds nix from upstream source
+  — not from nixpkgs' component-merged aggregator — so the patches land on
+  the actual source being compiled.
+- `bump-stable.yml` (daily 06:00 UTC + manual): queries
+  `gh api repos/NixOS/nix/releases/latest`, rewrites the `nix-upstream.url` in
+  `flake.nix` if the tag changed, runs `nix flake update`, and commits.
+- `build-and-cache.yml` (on push to main): matrix builds on `macos-latest`
+  (aarch64-darwin) and `ubuntu-24.04-arm` (aarch64-linux), runs
+  `./result/bin/nix --version` as a smoke test, pushes the closure to
+  `ak2k.cachix.org` via `cachix-action`.
 
 ## When this repo goes away
 

@@ -3,10 +3,12 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Track NixOS/nix at a specific stable tag. Bumped by bump-stable.yml.
+    nix-upstream.url = "github:NixOS/nix/2.34.5";
   };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, nix-upstream }:
     let
       systems = [
         "aarch64-darwin"
@@ -24,13 +26,19 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          patched = pkgs.nixVersions.latest.overrideAttrs (old: {
-            patches = (old.patches or [ ]) ++ patchFiles;
-          });
+          patchedSrc = pkgs.applyPatches {
+            name = "nix-patched-src";
+            src = nix-upstream;
+            patches = patchFiles;
+          };
+          # Re-evaluate nix-upstream's flake on the patched source via the
+          # flake-compat shim its `default.nix` already sets up. This avoids
+          # the `getFlake ... store-path` restriction.
+          patchedFlake = import patchedSrc;
         in
         {
-          default = patched;
-          nix = patched;
+          default = patchedFlake.packages.${system}.default;
+          nix = patchedFlake.packages.${system}.nix;
         }
       );
     };
