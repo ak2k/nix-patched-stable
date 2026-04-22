@@ -1,0 +1,35 @@
+name: build + cachix
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            system: aarch64-darwin
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: ak2k
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build patched nix
+        run: nix build --print-build-logs .#packages.${{ matrix.system }}.default
+
+      - name: Smoke test
+        run: ./result/bin/nix --version

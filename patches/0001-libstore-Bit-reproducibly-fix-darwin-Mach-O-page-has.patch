@@ -1,0 +1,795 @@
+From 0d7cfdb2796f6ac36aefebe2defba0e8a7546233 Mon Sep 17 00:00:00 2001
+From: ak2k <19240940+ak2k@users.noreply.github.com>
+Date: Tue, 7 Apr 2026 20:23:44 -0400
+Subject: [PATCH 1/2] libstore: Bit-reproducibly fix darwin Mach-O page hashes
+ after rewriting
+
+This is based on the work of @andrewgazelka in #14999.
+
+On darwin, `DerivationBuilderImpl::registerOutputs` calls `RewritingSink`
+to substitute scratch-path bytes in build outputs. When one output's
+binary embeds a sibling output's store path via `${builtins.placeholder
+"doc"}` and the sibling is already in the store at build start, the
+embedded bytes are the sibling's scratch path (from `makeFallbackPath`),
+which `registerOutputs` rewrites to the final hash after the builder
+exits. The substitution is byte-level and has no knowledge of Mach-O
+code signatures, but Apple's `ld` ad-hoc-signs every binary at link
+time with the `linker-signed` flag set in `LC_CODE_SIGNATURE`. The
+signature covers the very bytes that were just rewritten, so one or
+more SHA-256 page hashes in the `CodeDirectory` are stale after the
+rewrite, and the macOS kernel SIGKILLs the binary at first page-in
+with `cs_invalid_page`. This surfaces in nixpkgs as
+https://github.com/NixOS/nixpkgs/issues/507531 (fish on
+`nixpkgs-darwin` fails to start).
+
+Add a darwin-only helper, `fixupMachoPageHashes`, called from the
+`rewriteOutput` lambda after `movePath` and before
+`canonicalisePathMetaData`. The helper recomputes only the affected
+page-hash slots in place, leaving every other byte of the Mach-O
+unchanged, including the `linker-signed` flag, the original 4 KiB
+page size, the identifier, and every special slot. The fix-up is
+length-preserving, so the result is bit-identical to a clean build of
+the same input.
+
+The same call site covers both `InputAddressed` and `CAFloating`/
+`CAFixed`/`Impure` visitors, since they all go through the shared
+`rewriteOutput` lambda.
+
+Differences from #14999: (a) cover the InputAddressed call site, which
+is what bites fish on `nixpkgs-darwin`; (b) preserve bit-reproducibility
+so `nix build --check` does not fire on the rewrite alone; (c) preserve
+`linker-signed` and the 4 KiB page size, both of which `codesign(1)`
+would clear.
+
+Closes: #6065
+---
+ .../rl-next/darwin-mach-o-page-hash-fixup.md  |  23 ++
+ .../unix/build/darwin-mach-o-rewrite.cc       | 376 ++++++++++++++++++
+ .../unix/build/darwin-mach-o-rewrite.hh       |  41 ++
+ src/libstore/unix/build/derivation-builder.cc |  16 +
+ src/libstore/unix/meson.build                 |   4 +
+ tests/functional/ca/macho-rewrite.sh          |  20 +
+ tests/functional/ca/meson.build               |   1 +
+ tests/functional/macho-rewrite.nix            |  34 ++
+ tests/functional/macho-rewrite.sh             | 128 ++++++
+ tests/functional/meson.build                  |   1 +
+ 10 files changed, 644 insertions(+)
+ create mode 100644 doc/manual/rl-next/darwin-mach-o-page-hash-fixup.md
+ create mode 100644 src/libstore/unix/build/darwin-mach-o-rewrite.cc
+ create mode 100644 src/libstore/unix/build/darwin-mach-o-rewrite.hh
+ create mode 100644 tests/functional/ca/macho-rewrite.sh
+ create mode 100644 tests/functional/macho-rewrite.nix
+ create mode 100644 tests/functional/macho-rewrite.sh
+
+diff --git a/doc/manual/rl-next/darwin-mach-o-page-hash-fixup.md b/doc/manual/rl-next/darwin-mach-o-page-hash-fixup.md
+new file mode 100644
+index 000000000..ef9085ca3
+--- /dev/null
++++ b/doc/manual/rl-next/darwin-mach-o-page-hash-fixup.md
+@@ -0,0 +1,23 @@
++---
++synopsis: Fix darwin Mach-O code signature corruption from output rewriting
++issues: [6065]
++prs: [15638]
++---
++
++On darwin, the build daemon's scratch-path rewriting pass
++(`RewritingSink`, applied in `registerOutputs` after the builder
++exits) mutated bytes inside pages that `ld -adhoc_codesign` had
++already covered with page hashes in `LC_CODE_SIGNATURE`. Affected
++multi-output derivations produced binaries whose stored page hashes
++no longer matched the on-disk bytes, and the macOS kernel SIGKILLed
++them at first page-in with `cs_invalid_page`. This surfaced in
++nixpkgs as [#507531](https://github.com/NixOS/nixpkgs/issues/507531)
++(fish on `nixpkgs-darwin`).
++
++The daemon now recomputes only the affected page hash slots in place
++after `RewritingSink` runs. Every other byte of the Mach-O is
++unchanged — including the `linker-signed` flag, the original 4 KiB
++page size, and the identifier — so the fix-up is length-preserving
++and the result is bit-identical to a clean build. A single call site
++inside the shared `rewriteOutput` lambda covers both input-addressed
++and content-addressing multi-output derivations.
+diff --git a/src/libstore/unix/build/darwin-mach-o-rewrite.cc b/src/libstore/unix/build/darwin-mach-o-rewrite.cc
+new file mode 100644
+index 000000000..6cb95ba42
+--- /dev/null
++++ b/src/libstore/unix/build/darwin-mach-o-rewrite.cc
+@@ -0,0 +1,376 @@
++#ifdef __APPLE__
++
++#  include "darwin-mach-o-rewrite.hh"
++
++#  include "nix/util/error.hh"
++#  include "nix/util/file-system.hh"
++#  include "nix/util/hash.hh"
++#  include "nix/util/logging.hh"
++
++#  include <mach-o/fat.h>
++#  include <mach-o/loader.h>
++
++#  include <algorithm>
++#  include <cstdint>
++#  include <cstring>
++#  include <string>
++#  include <string_view>
++
++namespace nix {
++
++namespace {
++
++/* CS_* code-signing blob constants. Apple does not ship a userspace
++   header for these, so we mirror the names from the xnu source
++   (`bsd/sys/codesign.h`). Big-endian on disk regardless of host. */
++constexpr uint32_t CSMAGIC_EMBEDDED_SIGNATURE = 0xfade0cc0;
++constexpr uint32_t CSMAGIC_CODEDIRECTORY = 0xfade0c02;
++
++constexpr uint8_t CS_HASHTYPE_SHA256 = 2;
++constexpr uint8_t CS_HASHSIZE_SHA256 = 32;
++
++/* Cap the size of files we will load wholesale into memory. Anything
++   larger than this is implausibly a Mach-O binary in a nixpkgs build
++   output and is more likely a builder's runaway artefact (or a
++   resource-exhaustion attempt). */
++constexpr size_t maxFileSize = 512 * 1024 * 1024;
++
++/* Reasonable upper bound on the CodeDirectory page size exponent. Apple
++   ships 12 (4 KiB) for linker-signed binaries and 14 (16 KiB) for
++   `codesign(1)` output; 16 (64 KiB) is the practical maximum. */
++constexpr uint8_t maxPageSizeLog2 = 16;
++
++uint32_t rdBE32(const uint8_t * p)
++{
++    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
++}
++
++/**
++ * Process one Mach-O slice starting at `sliceBase` inside `data`.
++ * Mutates `data` in place. Returns `true` iff at least one CodeDirectory
++ * hash slot was rewritten.
++ */
++bool fixupSlice(std::string & data, size_t sliceBase, const std::filesystem::path & path)
++{
++    /* `data` is owned by the caller and is not resized anywhere in this
++       function, so this pointer remains valid for the entire body. We
++       intentionally cast away `char` for the byte-level reads below;
++       writes through this pointer in the slot-update loop are safe for
++       the same reason. */
++    auto * bytes = reinterpret_cast<uint8_t *>(data.data());
++
++    if (sliceBase + sizeof(mach_header) > data.size())
++        return false;
++
++    /* The mach_header / mach_header_64 fields are stored in native
++       byte order. We memcpy into a local to avoid undefined-behaviour
++       from a `reinterpret_cast` through a non-aliasing pointer. */
++    mach_header mhProbe;
++    std::memcpy(&mhProbe, bytes + sliceBase, sizeof(mhProbe));
++
++    bool is64;
++    if (mhProbe.magic == MH_MAGIC_64)
++        is64 = true;
++    else if (mhProbe.magic == MH_MAGIC)
++        is64 = false;
++    else
++        /* Either not a Mach-O slice (e.g. random data inside a fat
++           container), or a byte-swapped header from an architecture
++           Apple has not shipped in 20 years. Either way, leave it. */
++        return false;
++
++    size_t headerSize = is64 ? sizeof(mach_header_64) : sizeof(mach_header);
++    if (sliceBase + headerSize > data.size())
++        return false;
++
++    uint32_t ncmds;
++    uint32_t sizeofcmds;
++    if (is64) {
++        mach_header_64 mh;
++        std::memcpy(&mh, bytes + sliceBase, sizeof(mh));
++        ncmds = mh.ncmds;
++        sizeofcmds = mh.sizeofcmds;
++    } else {
++        ncmds = mhProbe.ncmds;
++        sizeofcmds = mhProbe.sizeofcmds;
++    }
++
++    if (sliceBase + headerSize + sizeofcmds > data.size())
++        return false;
++
++    size_t lcOff = sliceBase + headerSize;
++    size_t lcEnd = lcOff + sizeofcmds;
++    bool found = false;
++    uint32_t sigOff = 0;
++    uint32_t sigSize = 0;
++    for (uint32_t i = 0; i < ncmds; i++) {
++        if (lcOff + sizeof(load_command) > lcEnd)
++            return false;
++        load_command lc;
++        std::memcpy(&lc, bytes + lcOff, sizeof(lc));
++        if (lc.cmdsize < sizeof(load_command) || lcOff + lc.cmdsize > lcEnd)
++            return false;
++        if (lc.cmd == LC_CODE_SIGNATURE) {
++            if (lc.cmdsize < sizeof(linkedit_data_command))
++                return false;
++            linkedit_data_command sigCmd;
++            std::memcpy(&sigCmd, bytes + lcOff, sizeof(sigCmd));
++            sigOff = sigCmd.dataoff;
++            sigSize = sigCmd.datasize;
++            found = true;
++            break;
++        }
++        lcOff += lc.cmdsize;
++    }
++    if (!found)
++        return false;
++
++    /* The signature SuperBlob lives at sliceBase + sigOff. For a thin
++       Mach-O sliceBase is zero; for a fat slice the file offset stored
++       in `LC_CODE_SIGNATURE` is relative to the slice, not the file. */
++    constexpr size_t superBlobHeaderSize = 12; // magic + length + count
++    constexpr size_t blobIndexSize = 8;        // type + offset
++    size_t sbAbs = sliceBase + sigOff;
++    if (sbAbs + superBlobHeaderSize > data.size() || sbAbs + sigSize > data.size())
++        return false;
++
++    if (rdBE32(bytes + sbAbs) != CSMAGIC_EMBEDDED_SIGNATURE)
++        return false;
++
++    uint32_t sbCount = rdBE32(bytes + sbAbs + 8);
++
++    bool modified = false;
++
++    /* Binaries can carry multiple CodeDirectories (e.g. SHA-1 + SHA-256
++       alternates for older macOS); process each, skip non-SHA-256. */
++    for (uint32_t bi = 0; bi < sbCount; bi++) {
++        size_t entryOff = sbAbs + superBlobHeaderSize + size_t(bi) * blobIndexSize;
++        if (entryOff + blobIndexSize > sbAbs + sigSize)
++            break;
++        uint32_t blobRel = rdBE32(bytes + entryOff + 4);
++        size_t blobAbs = sbAbs + blobRel;
++        if (blobAbs + 8 > sbAbs + sigSize)
++            continue;
++
++        if (rdBE32(bytes + blobAbs) != CSMAGIC_CODEDIRECTORY)
++            continue;
++
++        /* CS_CodeDirectory header through `pageSizeLog2` is 44 bytes;
++           newer versions append `teamOffset`, `codeLimit64`,
++           `execSegBase`, `runtime`, etc., but we never read past
++           `pageSizeLog2` so older binaries are fine. */
++        constexpr size_t cdHeaderSize = 44;
++        if (blobAbs + cdHeaderSize > sbAbs + sigSize)
++            continue;
++
++        uint32_t cdLength = rdBE32(bytes + blobAbs + 4);
++
++        /* Defense in depth: validate that the entire CodeDirectory blob
++           lies inside the SuperBlob. The slot bounds check below catches
++           the worst case (out-of-file write), but a malformed blob could
++           still claim a `cdLength` that overruns the SuperBlob structure
++           while leaving the slot region in-bounds. Reject early. */
++        if (cdLength < cdHeaderSize || blobAbs + cdLength > sbAbs + sigSize) {
++            warn("fixupMachoPageHashes: %s: CodeDirectory length out of bounds, skipping", PathFmt(path));
++            continue;
++        }
++
++        uint32_t hashOffset = rdBE32(bytes + blobAbs + 16);
++        uint32_t nSpecialSlots = rdBE32(bytes + blobAbs + 24);
++        uint32_t nCodeSlots = rdBE32(bytes + blobAbs + 28);
++        uint32_t codeLimit = rdBE32(bytes + blobAbs + 32);
++        uint8_t hashSize = bytes[blobAbs + 36];
++        uint8_t hashType = bytes[blobAbs + 37];
++        uint8_t pageSizeLog2 = bytes[blobAbs + 39];
++
++        if (hashType != CS_HASHTYPE_SHA256) {
++            warn(
++                "fixupMachoPageHashes: %s: CodeDirectory hashType=%d (not SHA-256), skipping",
++                PathFmt(path),
++                int(hashType));
++            continue;
++        }
++        if (hashSize != CS_HASHSIZE_SHA256) {
++            warn(
++                "fixupMachoPageHashes: %s: SHA-256 CodeDirectory has hashSize=%d, skipping",
++                PathFmt(path),
++                int(hashSize));
++            continue;
++        }
++        if (pageSizeLog2 == 0 || pageSizeLog2 > maxPageSizeLog2) {
++            warn("fixupMachoPageHashes: %s: unsupported pageSizeLog2=%d, skipping", PathFmt(path), int(pageSizeLog2));
++            continue;
++        }
++
++        /* Validate that the special-slot region (negative indices,
++           hashing other blobs) lives entirely below the code-slot
++           region — otherwise the CodeDirectory is corrupt. */
++        if (size_t(nSpecialSlots) * hashSize > hashOffset) {
++            warn(
++                "fixupMachoPageHashes: %s: nSpecialSlots=%d overflows hashOffset=%d, skipping",
++                PathFmt(path),
++                nSpecialSlots,
++                hashOffset);
++            continue;
++        }
++
++        size_t pageSize = size_t(1) << pageSizeLog2;
++
++        /* Bounds-check the entire code-slot region against both the
++           CodeDirectory blob and the file. */
++        size_t slotsAbs = blobAbs + hashOffset;
++        size_t slotsEnd = slotsAbs + size_t(nCodeSlots) * hashSize;
++        if (slotsEnd > blobAbs + cdLength || slotsEnd > data.size()) {
++            warn("fixupMachoPageHashes: %s: CodeDirectory hash slots out of bounds, skipping", PathFmt(path));
++            continue;
++        }
++
++        debug(
++            "fixupMachoPageHashes: %s: nCodeSlots=%d pageSize=%d codeLimit=%d",
++            PathFmt(path),
++            nCodeSlots,
++            pageSize,
++            codeLimit);
++
++        for (uint32_t i = 0; i < nCodeSlots; i++) {
++            /* Promote `i` to size_t BEFORE the +1 to prevent uint32
++               wraparound on hypothetical massive nCodeSlots. */
++            size_t pageStart = sliceBase + size_t(i) * pageSize;
++            size_t pageEndUnclamped = sliceBase + (size_t(i) + 1) * pageSize;
++            size_t pageEndLimit = sliceBase + size_t(codeLimit);
++            size_t pageEnd = std::min(pageEndUnclamped, pageEndLimit);
++            if (pageEnd > data.size() || pageEnd < pageStart) {
++                warn("fixupMachoPageHashes: %s: page %d out of bounds, skipping", PathFmt(path), i);
++                continue;
++            }
++            std::string_view sv(data.data() + pageStart, pageEnd - pageStart);
++            Hash h = hashString(HashAlgorithm::SHA256, sv);
++            uint8_t * slot = bytes + slotsAbs + size_t(i) * CS_HASHSIZE_SHA256;
++            if (std::memcmp(slot, h.hash, CS_HASHSIZE_SHA256) != 0) {
++                std::memcpy(slot, h.hash, CS_HASHSIZE_SHA256);
++                modified = true;
++            }
++        }
++    }
++
++    return modified;
++}
++
++/**
++ * Read a regular file, fix up its Mach-O page hashes if needed, and
++ * write it back. Returns 1 if the file was modified, 0 otherwise.
++ *
++ * Throws on read/write failure of a file we have committed to
++ * rewriting, or on a Mach-O variant we cannot fix up (e.g. 64-bit
++ * fat).
++ */
++size_t fixupFile(const std::filesystem::path & path)
++{
++    std::error_code ec;
++    auto sz = std::filesystem::file_size(path, ec);
++    if (ec || sz < sizeof(mach_header))
++        return 0;
++    if (sz > maxFileSize)
++        return 0;
++
++    /* `readFile` returns the file as a `std::string`. Random access on
++       a flat byte buffer is the right primitive here — `Source` is
++       streaming-only and our parser needs to seek into the
++       `LC_CODE_SIGNATURE` blob and back. The `reinterpret_cast` to
++       `uint8_t *` below is well-defined as of C++17 (`std::string::data`
++       returns a pointer to the contiguous storage). */
++    std::string data = readFile(path);
++
++    auto * bytes = reinterpret_cast<const uint8_t *>(data.data());
++    uint32_t magicLE;
++    std::memcpy(&magicLE, bytes, sizeof(magicLE));
++    uint32_t magicBE = rdBE32(bytes);
++
++    bool modified = false;
++
++    if (magicLE == MH_MAGIC || magicLE == MH_MAGIC_64) {
++        modified = fixupSlice(data, 0, path);
++    } else if (magicBE == FAT_MAGIC) {
++        /* Apple's `fat_arch` struct is byte-swapped on little-endian
++           hosts, so we read the big-endian fields by hand. */
++        uint32_t nfat = rdBE32(bytes + 4);
++        for (uint32_t i = 0; i < nfat; i++) {
++            size_t archOff = sizeof(fat_header) + size_t(i) * sizeof(fat_arch);
++            if (archOff + sizeof(fat_arch) > data.size())
++                break;
++            uint32_t sliceOff = rdBE32(reinterpret_cast<const uint8_t *>(data.data()) + archOff + 8);
++            if (fixupSlice(data, sliceOff, path))
++                modified = true;
++        }
++    } else if (magicBE == FAT_MAGIC_64) {
++        /* 64-bit fat is rare in practice but real (Apple's own toolchain
++           emits it for very large slices). Refusing loudly is better
++           than silently leaving an unrunnable binary in the store. */
++        throw Error(
++            "fixupMachoPageHashes: %s: 64-bit fat Mach-O binaries are not yet supported (nixpkgs#507531 follow-up)",
++            PathFmt(path));
++    } else {
++        return 0;
++    }
++
++    if (!modified)
++        return 0;
++
++    /* Write back. We don't bother preserving the original mode bits:
++       `canonicalisePathMetaData` runs immediately after this in the
++       same lambda and resets perms, uid, gid, and mtime to canonical
++       values. Use `0600` as a safe transient mode that excludes
++       setuid/setgid/sticky. */
++    writeFile(path, std::string_view{data}, 0600);
++    return 1;
++}
++
++} // namespace
++
++size_t fixupMachoPageHashes(const std::filesystem::path & path)
++{
++    std::error_code ec;
++    auto st = std::filesystem::symlink_status(path, ec);
++    if (ec)
++        return 0;
++
++    if (std::filesystem::is_symlink(st))
++        return 0;
++
++    if (std::filesystem::is_regular_file(st))
++        return fixupFile(path);
++
++    if (!std::filesystem::is_directory(st))
++        return 0;
++
++    /* `recursive_directory_iterator` does not follow symlinks by
++       default, but it does still yield file symlinks inside real
++       directories — hence the explicit `is_symlink` skip below. */
++    size_t count = 0;
++    auto it = std::filesystem::recursive_directory_iterator(
++        path, std::filesystem::directory_options::skip_permission_denied, ec);
++    auto end = std::filesystem::recursive_directory_iterator();
++    for (; it != end; it.increment(ec)) {
++        if (ec) {
++            debug(
++                "fixupMachoPageHashes: %s: directory iteration error, skipping entry: %s", PathFmt(path), ec.message());
++            ec.clear();
++            continue;
++        }
++        std::error_code sec;
++        auto est = it->symlink_status(sec);
++        if (sec) {
++            debug("fixupMachoPageHashes: %s: cannot stat entry, skipping: %s", PathFmt(it->path()), sec.message());
++            continue;
++        }
++        if (std::filesystem::is_symlink(est))
++            continue;
++        if (std::filesystem::is_regular_file(est))
++            count += fixupFile(it->path());
++    }
++    return count;
++}
++
++} // namespace nix
++
++#endif // __APPLE__
+diff --git a/src/libstore/unix/build/darwin-mach-o-rewrite.hh b/src/libstore/unix/build/darwin-mach-o-rewrite.hh
+new file mode 100644
+index 000000000..94d0018d4
+--- /dev/null
++++ b/src/libstore/unix/build/darwin-mach-o-rewrite.hh
+@@ -0,0 +1,41 @@
++#pragma once
++///@file
++
++#include <cstddef>
++#include <filesystem>
++
++namespace nix {
++
++/**
++ * Recompute Mach-O `LC_CODE_SIGNATURE` page hashes for any pages whose
++ * stored SHA-256 disagrees with the actual on-disk page contents,
++ * preserving every other byte of the file (including the
++ * `linker-signed` flag and the original page size).
++ *
++ * This is the bit-reproducible repair for outputs whose `__TEXT,__cstring`
++ * pages were mutated by `RewritingSink` after the linker had already
++ * ad-hoc-signed them. The same input bytes always yield the same output
++ * bytes, unlike re-signing via `codesign(1)` (which switches to a 16 KiB
++ * page size and clears `linker-signed`).
++ *
++ * Walks recursively if `path` is a directory; processes a single file
++ * otherwise. Symlinks are never followed. Files that are not Mach-O,
++ * are unsigned, use unsupported hash types, or already have hashes that
++ * match their pages are no-ops.
++ *
++ * @param path Output path that has just been moved into place. The caller
++ *   must own this path exclusively (no concurrent mutators); within
++ *   `DerivationBuilderImpl::registerOutputs` this is guaranteed because
++ *   the builder process has exited and the daemon has not yet handed
++ *   the path off.
++ * @return Number of regular files that were rewritten.
++ *
++ * Throws `SysError` if a file we have committed to rewriting cannot be
++ * read or written, or `Error` if a Mach-O variant we cannot fix up
++ * (e.g. 64-bit fat) is encountered.
++ *
++ * See nixpkgs#507531 / NixOS/nix#6065.
++ */
++size_t fixupMachoPageHashes(const std::filesystem::path & path);
++
++} // namespace nix
+diff --git a/src/libstore/unix/build/derivation-builder.cc b/src/libstore/unix/build/derivation-builder.cc
+index fc877dd56..e60f5720a 100644
+--- a/src/libstore/unix/build/derivation-builder.cc
++++ b/src/libstore/unix/build/derivation-builder.cc
+@@ -42,6 +42,10 @@
+ #include <grp.h>
+ #include <iostream>
+ 
++#ifdef __APPLE__
++#  include "darwin-mach-o-rewrite.hh"
++#endif
++
+ #include "nix/util/strings.hh"
+ #include "nix/util/signals.hh"
+ 
+@@ -1645,6 +1649,18 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs()
+                 deletePath(actualPath);
+                 movePath(tmpPath, actualPath);
+ 
++#ifdef __APPLE__
++                /* nixpkgs#507531 / NixOS/nix#6065: `RewritingSink` above
++                   mutates bytes inside `__TEXT,__cstring` pages that the
++                   linker had already covered with ad-hoc page hashes
++                   (`linker-signed` in `LC_CODE_SIGNATURE`), so the
++                   resulting binary SIGKILLs at first page-in. Recompute
++                   the affected slots in place; preserves every other
++                   byte and is therefore bit-reproducible. */
++                if (size_t fixed = fixupMachoPageHashes(actualPath); fixed > 0)
++                    debug("fixupMachoPageHashes: rewrote %1% Mach-O file(s) under %2%", fixed, PathFmt(actualPath));
++#endif
++
+                 /* FIXME: set proper permissions in restorePath() so
+                    we don't have to do another traversal. */
+                 canonicalisePathMetaData(
+diff --git a/src/libstore/unix/meson.build b/src/libstore/unix/meson.build
+index 4b8a6b105..3600478e4 100644
+--- a/src/libstore/unix/meson.build
++++ b/src/libstore/unix/meson.build
+@@ -6,4 +6,8 @@ sources += files(
+   'user-lock.cc',
+ )
+ 
++if host_machine.system() == 'darwin'
++  sources += files('build/darwin-mach-o-rewrite.cc')
++endif
++
+ subdir('include/nix/store')
+diff --git a/tests/functional/ca/macho-rewrite.sh b/tests/functional/ca/macho-rewrite.sh
+new file mode 100644
+index 000000000..713647d71
+--- /dev/null
++++ b/tests/functional/ca/macho-rewrite.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++
++# CA-derivation variant of `tests/functional/macho-rewrite.sh`. Same
++# bug, same trigger, same assertions — but with `__contentAddressed =
++# true; outputHashMode = "recursive"; outputHashAlgo = "sha256";`
++# injected into the test fixture via the framework's
++# `NIX_TESTS_CA_BY_DEFAULT=1` mechanism.
++#
++# This exists because issue NixOS/nix#6065 (which this fix closes) was
++# filed against CA derivations specifically. The shared call site
++# inside the `rewriteOutput` lambda at `derivation-builder.cc:~1651`
++# covers both `InputAddressed` and `CAFloating`/`CAFixed`/`Impure`
++# visitors, but a code-reading argument is weaker than a tested fact.
++
++source common.sh
++
++export NIX_TESTS_CA_BY_DEFAULT=1
++cd ..
++# shellcheck source=/dev/null
++source ./macho-rewrite.sh
+diff --git a/tests/functional/ca/meson.build b/tests/functional/ca/meson.build
+index b1912fd86..9916a3c7d 100644
+--- a/tests/functional/ca/meson.build
++++ b/tests/functional/ca/meson.build
+@@ -20,6 +20,7 @@ suites += {
+     'gc.sh',
+     'import-from-derivation.sh',
+     'issue-13247.sh',
++    'macho-rewrite.sh',
+     'multiple-outputs.sh',
+     'new-build-cmd.sh',
+     'nix-copy.sh',
+diff --git a/tests/functional/macho-rewrite.nix b/tests/functional/macho-rewrite.nix
+new file mode 100644
+index 000000000..23ba0284f
+--- /dev/null
++++ b/tests/functional/macho-rewrite.nix
+@@ -0,0 +1,34 @@
++with import ./config.nix;
++
++# Multi-output input-addressed derivation whose `out` binary embeds a
++# placeholder for the `doc` output. After the builder exits, the daemon
++# rewrites the placeholder bytes to the final `doc` hash inside
++# `bin/hello`. Apple's `ld` ad-hoc-signed the binary at link time over the
++# pre-rewrite bytes, so the rewrite invalidates one or more SHA-256 page
++# hashes in `LC_CODE_SIGNATURE.CodeDirectory`. Without the page-hash
++# fix-up in `DerivationBuilderImpl::registerOutputs`, the kernel SIGKILLs
++# the binary at first page-in.
++
++mkDerivation {
++  name = "macho-rewrite-multi";
++  outputs = [
++    "out"
++    "doc"
++  ];
++  docPlaceholder = "${builtins.placeholder "doc"}/share/doc/hello";
++  buildCommand = ''
++    cat > main.c <<'EOF'
++    #include <stdio.h>
++    int main(void) {
++        printf("doc=%s\n", DOC_PATH);
++        return 0;
++    }
++    EOF
++    /usr/bin/cc -O0 \
++      -DDOC_PATH="\"$docPlaceholder\"" \
++      -o hello main.c
++    mkdir -p "$out/bin" "$doc/share/doc"
++    cp hello "$out/bin/hello"
++    echo "hello docs" > "$doc/share/doc/hello"
++  '';
++}
+diff --git a/tests/functional/macho-rewrite.sh b/tests/functional/macho-rewrite.sh
+new file mode 100644
+index 000000000..5b1f11a86
+--- /dev/null
++++ b/tests/functional/macho-rewrite.sh
+@@ -0,0 +1,128 @@
++#!/usr/bin/env bash
++
++# Regression test for nixpkgs#507531 / NixOS/nix#6065.
++#
++# `RewritingSink` mutates bytes inside `__TEXT,__cstring` pages that
++# Apple's `ld` had already covered with `linker-signed` SHA-256 page
++# hashes in `LC_CODE_SIGNATURE`. Without the page-hash fix-up in
++# `DerivationBuilderImpl::registerOutputs`, the rewritten binary
++# SIGKILLs at first page-in with `cs_invalid_page`.
++#
++# IA trigger condition (CA is simpler; see the inline IA/CA split
++# below): the bug only fires when at least one sibling output is
++# already in the store at the start of a multi-output build, so that
++# the sibling's scratch path becomes a `makeFallbackPath` placeholder
++# which `RewritingSink` then substitutes for the final hash inside the
++# already-signed `bin/hello`. A fresh cold build does not populate
++# `outputRewrites` for siblings, so the bug does not trigger and a
++# cold-build-only test would pass on an unpatched daemon. We therefore
++# build cold and then re-invoke under `--check`, which is Nix's own
++# determinism check: it rebuilds the derivation while the previous
++# outputs are still in the store, materialising the corrupted binary in
++# a `.check` directory. No `nix-store --delete` or other state mutation
++# is required.
++#
++# `--check` is *expected* to fail with `may not be deterministic` here,
++# because Apple's `ld_prime` generates a non-deterministic `LC_UUID`
++# even with identical inputs (and macOS does not let us turn `LC_UUID`
++# off — `dyld` rejects binaries that lack one). The test allows
++# `--check` to fail and inspects the resulting `.check` binary.
++#
++# Assertions on the post-rewrite binary (`$out.check` in IA mode,
++# `$out` in CA mode):
++#   1. it executes (no SIGKILL — the load-bearing regression assertion:
++#      any helper bug that produces stale page hashes manifests here as
++#      a kernel kill)
++#   2. its embedded `doc=` string contains the *final* doc hash, not the
++#      pre-rewrite placeholder (proves the substitution actually
++#      happened and the helper didn't accidentally restore pre-rewrite
++#      bytes)
++#   3. `codesign --verify` accepts the signature (catches any helper bug
++#      that corrupts the SuperBlob structure)
++#   4. `codesign -dvvv` reports `flags=0x20002(adhoc,linker-signed)`,
++#      proving the original `ld` signature was preserved rather than
++#      replaced by a `codesign(1)` re-sign (which would clear the
++#      `linker-signed` bit and switch to 16 KiB pages)
++
++source common.sh
++
++if [[ $(uname) != Darwin ]]; then
++    skipTest "Mach-O page-hash rewriting is darwin-specific"
++fi
++
++if ! [[ -x /usr/bin/cc ]]; then
++    skipTest "Need /usr/bin/cc to build the test fixture"
++fi
++
++if ! [[ -x /usr/bin/codesign ]]; then
++    skipTest "Need /usr/bin/codesign to validate signatures"
++fi
++
++# Build the multi-output derivation. The exact trigger condition
++# differs between IA and CA derivations:
++#
++#   - **InputAddressed**: the bug only fires when at least one sibling
++#     output is already in the store at the start of the build, so the
++#     sibling's scratch path becomes a `makeFallbackPath` placeholder.
++#     A fresh cold build does not populate `outputRewrites` for
++#     siblings and therefore does not trigger the bug. We seed the
++#     store with a cold build, then re-invoke under `nix-build --check`
++#     — Nix's own determinism check rebuilds the derivation while the
++#     previous outputs are still in the store, materialising the
++#     corrupted (or fixed-up, on a patched daemon) binary in a `.check`
++#     directory. No `nix-store --delete` or other state mutation is
++#     required.
++#
++#   - **ContentAddressed** (issue NixOS/nix#6065 was filed against this
++#     case): the cold build *itself* substitutes the scratch hash for
++#     the final content-addressed hash inside the rewriteOutput lambda,
++#     so the bug fires immediately. `--check` is unnecessary (and would
++#     succeed silently rather than producing a `.check`, since CA
++#     content-equality is verified per build).
++#
++# `NIX_TESTS_CA_BY_DEFAULT=1` is the framework convention used by the
++# tests under `tests/functional/ca/`; it makes `mkDerivation` in the
++# generated `config.nix` inject `__contentAddressed = true`,
++# `outputHashMode = "recursive"`, `outputHashAlgo = "sha256"`.
++out=$(nix-build --no-out-link ./macho-rewrite.nix)
++[[ -x "$out/bin/hello" ]]
++
++if [[ "${NIX_TESTS_CA_BY_DEFAULT:-}" == "1" ]]; then
++    # CA: the cold build already triggered the bug. Run assertions
++    # against `$out` directly.
++    target="$out"
++else
++    # IA: trigger the bug via Nix's determinism check. Expected to
++    # fail with `may not be deterministic` because Apple's `ld_prime`
++    # generates a non-deterministic `LC_UUID` even with identical
++    # inputs (and macOS does not let us turn `LC_UUID` off — `dyld`
++    # rejects binaries that lack one), so the rebuild always differs
++    # from the original. The `.check` directory contains the
++    # post-rewrite-and-fixup binary. Exit code 104 is Nix's dedicated
++    # status bit for `checkMismatch` — see `failingExitStatus` in
++    # `src/libstore/build-result.cc`.
++    expect 104 nix-build --no-out-link --check --keep-failed ./macho-rewrite.nix
++    target="${out}.check"
++    [[ -x "$target/bin/hello" ]]
++fi
++
++# Step 1 — binary executes (no SIGKILL — the load-bearing regression
++# assertion: any helper bug that produces stale page hashes manifests
++# here as a kernel kill)
++output=$("$target/bin/hello")
++echo "$output"
++
++# Step 2 — embedded doc path is the final one (proves the substitution
++# actually happened and the helper didn't accidentally restore
++# pre-rewrite bytes). Match against `$NIX_STORE_DIR` rather than a
++# hardcoded `/nix/store` so the assertion holds under the functional
++# test harness, which points the store at a temporary directory.
++echo "$output" | grep -qE "^doc=${NIX_STORE_DIR:-/nix/store}/[a-z0-9]{32}-macho-rewrite-multi-doc/share/doc/hello$"
++
++# Step 3 — codesign verifies the (rewritten + fixed-up) signature
++/usr/bin/codesign --verify "$target/bin/hello"
++
++# Step 4 — `linker-signed` flag preserved (cleared by every
++# `codesign(1)` invocation, so this catches any future refactor that
++# swaps the in-process helper for a shellout)
++/usr/bin/codesign -dvvv "$target/bin/hello" 2>&1 | grep -qF 'flags=0x20002(adhoc,linker-signed)'
+diff --git a/tests/functional/meson.build b/tests/functional/meson.build
+index bc4d2643e..fcb351a6b 100644
+--- a/tests/functional/meson.build
++++ b/tests/functional/meson.build
+@@ -175,6 +175,7 @@ suites = [
+       'impure-env.sh',
+       'debugger.sh',
+       'extra-sandbox-profile.sh',
++      'macho-rewrite.sh',
+       'help.sh',
+       'symlinks.sh',
+       'external-builders.sh',
+-- 
+2.51.2
+

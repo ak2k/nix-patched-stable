@@ -1,0 +1,35 @@
+name: bump nixpkgs
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Update nixpkgs input
+        run: nix flake update nixpkgs
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet flake.lock; then
+            echo "nixpkgs already at latest"
+            exit 0
+          fi
+          git config user.name  'bump-bot'
+          git config user.email 'bump-bot@users.noreply.github.com'
+          new_rev=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock | cut -c1-12)
+          git add flake.lock
+          git commit -m "bump: nixpkgs → ${new_rev}"
+          git push
