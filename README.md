@@ -50,7 +50,7 @@ nix.settings.trusted-public-keys = [
 ];
 ```
 
-Systems published: `aarch64-darwin`, `aarch64-linux`.
+Systems published: `aarch64-darwin`. The bug is darwin-only (`#ifdef __APPLE__`), so we don't ship a linux build.
 
 ## How it works
 
@@ -63,10 +63,9 @@ Systems published: `aarch64-darwin`, `aarch64-linux`.
 - `bump-stable.yml` (daily 06:00 UTC + manual): queries
   `gh api repos/NixOS/nix/releases/latest`, rewrites the `nix-upstream.url` in
   `flake.nix` if the tag changed, runs `nix flake update`, and commits.
-- `build-and-cache.yml` (on push to main): matrix builds on `macos-latest`
-  (aarch64-darwin) and `ubuntu-24.04-arm` (aarch64-linux), runs
-  `./result/bin/nix --version` as a smoke test, pushes the closure to
-  `ak2k.cachix.org` via `cachix-action`.
+- `build-and-cache.yml` (on push to main): builds on `macos-latest`
+  (aarch64-darwin), runs `./result/bin/nix --version` as a smoke test,
+  pushes the closure to `ak2k.cachix.org` via `cachix-action`.
 
 ## When this repo goes away
 

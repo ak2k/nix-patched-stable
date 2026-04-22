@@ -10,9 +10,13 @@
   outputs =
     { self, nixpkgs, nix-upstream }:
     let
+      # The Mach-O page-hash fix is darwin-only (`#ifdef __APPLE__`), so
+      # shipping an aarch64-linux build just burns CI cycles. Upstream
+      # nix's aarch64-linux test suite also happens to be unreliable
+      # under GHA's ubuntu-24.04-arm runner (fchmodatTryNoFollow), but
+      # that's secondary — the core reason is "no consumer".
       systems = [
         "aarch64-darwin"
-        "aarch64-linux"
       ];
       forAllSystems =
         f: builtins.listToAttrs (map (system: { name = system; value = f system; }) systems);

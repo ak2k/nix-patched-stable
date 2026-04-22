@@ -12,8 +12,6 @@ jobs:
         include:
           - runner: macos-latest
             system: aarch64-darwin
-          - runner: ubuntu-24.04-arm
-            system: aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
