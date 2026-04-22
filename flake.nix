@@ -30,6 +30,12 @@
             name = "nix-patched-src";
             src = nix-upstream;
             patches = patchFiles;
+            # Tag `nix --version` so a user running this daemon can tell
+            # at a glance that it's patched, rather than confusing it with
+            # stock upstream. `+` is semver build-metadata.
+            postPatch = ''
+              echo "$(cat .version)+ak2k-mach-o-fix" > .version
+            '';
           };
           # Re-evaluate nix-upstream's flake on the patched source via the
           # flake-compat shim its `default.nix` already sets up. This avoids
