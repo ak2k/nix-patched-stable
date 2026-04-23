@@ -21,12 +21,17 @@ jobs:
       - name: Detect latest NixOS/nix release tag
         id: latest
         run: |
+          set -euo pipefail
           tag=$(
             gh api repos/NixOS/nix/tags --paginate --jq '.[].name' \
-              | rg '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
               | sort -V \
               | tail -1
           )
+          if [[ -z "$tag" ]]; then
+            echo "::error::failed to detect latest stable NixOS/nix tag"
+            exit 1
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -34,7 +39,12 @@ jobs:
       - name: Detect current pinned tag
         id: current
         run: |
+          set -euo pipefail
           current=$(grep -oE 'github:NixOS/nix/[0-9.]+' flake.nix | head -1 | sed 's|.*/||')
+          if [[ -z "$current" ]]; then
+            echo "::error::failed to detect current pinned NixOS/nix tag"
+            exit 1
+          fi
           echo "current=$current" >> "$GITHUB_OUTPUT"
 
       - name: Bump flake.nix if tag changed
