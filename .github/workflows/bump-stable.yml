@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -56,9 +57,12 @@ jobs:
         run: nix flake update
 
       - name: Commit if anything changed
+        id: commit
         run: |
+          set -euo pipefail
           if git diff --quiet flake.nix flake.lock; then
             echo "no changes"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name  'bump-bot'
@@ -71,3 +75,10 @@ jobs:
           fi
           git commit -m "$msg"
           git push
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch build + cachix
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-and-cache.yml --ref main
