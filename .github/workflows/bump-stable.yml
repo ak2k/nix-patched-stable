@@ -21,7 +21,12 @@ jobs:
       - name: Detect latest NixOS/nix release tag
         id: latest
         run: |
-          tag=$(gh api repos/NixOS/nix/releases/latest --jq .tag_name)
+          tag=$(
+            gh api repos/NixOS/nix/tags --paginate --jq '.[].name' \
+              | rg '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -1
+          )
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
