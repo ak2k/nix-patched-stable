@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Track NixOS/nix at a specific stable tag. Bumped by bump-stable.yml.
-    nix-upstream.url = "github:NixOS/nix/2.35.2";
+    nix-upstream.url = "github:NixOS/nix/2.35.3";
   };
 
   outputs =
